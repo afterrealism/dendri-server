@@ -1,0 +1,49 @@
+[package]
+name = "dendri"
+version = "0.1.0"
+edition = "2021"
+description = "Dendri signaling server in Rust with Redis persistence"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+redis = { version = "0.25", features = ["tokio-comp", "aio", "connection-manager"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "6"
+tower-http = { version = "0.5", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+mimalloc = { version = "0.1", default-features = false }
+reqwest = { version = "0.12", features = ["json"] }
+itoa = "1"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+jsonwebtoken = "9"
+async-stream = "0.3"
+subtle = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+proptest = "1.6"
+criterion = { version = "0.5", features = ["html_reports"] }
+wiremock = "0.6"
+tokio-test = "0.4"
+
+[[bench]]
+name = "routing"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
