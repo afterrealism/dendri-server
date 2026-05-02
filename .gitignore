@@ -1,0 +1,25 @@
+# Rust
+target/
+debug/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AI assistant scratch
+.claude/
+.cursor/
