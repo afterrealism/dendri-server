@@ -107,4 +107,12 @@ pub struct Config {
     /// Redis connection URL
     #[arg(long, env = "REDIS_URL", default_value = "redis://127.0.0.1:6379")]
     pub redis_url: String,
+
+    /// Strip ICE candidates from SDP before forwarding (privacy: prevents IP leaks)
+    #[arg(long, env = "DENDRI_STRIP_ICE_CANDIDATES")]
+    pub strip_ice_candidates: bool,
+
+    /// Enable telemetry collection for measurement studies (opt-in, anonymised)
+    #[arg(long, env = "DENDRI_TELEMETRY")]
+    pub telemetry_enabled: bool,
 }

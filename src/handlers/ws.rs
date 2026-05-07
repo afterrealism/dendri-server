@@ -120,6 +120,7 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
                 seq: None,
                 room: None,
                 timestamp: None,
+                topic_class: None,
             })
             .unwrap_or_default();
 
@@ -220,6 +221,7 @@ async fn run_client(
         seq: None,
         room: None,
         timestamp: None,
+        topic_class: None,
     })
     .unwrap_or_default();
     let _ = tx.send(open_msg);

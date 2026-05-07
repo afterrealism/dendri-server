@@ -22,6 +22,8 @@ pub struct Message {
     /// Server timestamp (epoch ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_class: Option<String>,
 }
 
 #[cfg(test)]
@@ -81,6 +83,7 @@ mod tests {
             seq: None,
             room: None,
             timestamp: None,
+            topic_class: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(json, r#"{"type":"OPEN"}"#);
@@ -96,6 +99,7 @@ mod tests {
             seq: Some(5),
             room: Some("room1".to_string()),
             timestamp: Some(1700000000000),
+            topic_class: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

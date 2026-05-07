@@ -163,6 +163,7 @@ async fn send_leave_to_source(state: &AppState, from_id: &str, to_id: &str) {
         payload: None,
         seq: None,
         room: None,
+        topic_class: None,
         timestamp: None,
     };
     let data = serialize_relay(&leave_msg);
@@ -230,15 +231,18 @@ async fn handle_data(state: &AppState, client_id: &str, mut msg: Message) {
                 }
             }
         }
-        // Store in replay buffer keyed by room.
-        state.replay_buffer.push(room_name, seq, data);
+        // H6: Ephemeral messages skip replay buffer (cursor/typing)
+        if msg.topic_class.as_deref() != Some("ephemeral") {
+            state.replay_buffer.push(room_name, seq, data);
+        }
     } else if let Some(ref dst_id) = msg.dst {
         // Point-to-point relay.
         if let Some(sender) = state.ws_senders.get(dst_id.as_str()) {
             let _ = sender.send(data.clone());
         }
-        // Store in replay buffer keyed by destination client.
-        state.replay_buffer.push(dst_id, seq, data);
+        if msg.topic_class.as_deref() != Some("ephemeral") {
+            state.replay_buffer.push(dst_id, seq, data);
+        }
     }
 }
 
