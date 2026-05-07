@@ -169,7 +169,6 @@ impl AppState {
             polling_receivers: Arc::new(DashMap::new()),
         })
     }
-
 }
 
 fn now_ms() -> i64 {

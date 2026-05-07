@@ -3,6 +3,9 @@ name = "dendri"
 version = "0.1.0"
 edition = "2021"
 description = "Dendri signaling server in Rust with Redis persistence"
+license = "AGPL-3.0-only"
+repository = "https://github.com/afterrealism/dendri-server"
+homepage = "https://dendri.dev"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
