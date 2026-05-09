@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::enums::{MessageType, PeerError};
+use crate::pii;
 use crate::models::message::Message;
 use crate::redis_realm;
 use crate::state::{AppState, PendingRemoval};
@@ -13,6 +17,15 @@ use crate::webhook::WebhookEvent;
 pub async fn handle_message(state: &AppState, client_id: &str, mut msg: Message) {
     // Overwrite src to prevent spoofing.
     msg.src = Some(client_id.to_string());
+
+    metrics::counter!("dendri_messages_total", "type" => msg.type_.as_str()).increment(1);
+
+    // Record message activity for idle-timeout tracking (heartbeats excluded).
+    if msg.type_ != MessageType::HEARTBEAT {
+        if let Some(meta) = state.clients.get(client_id) {
+            meta.record_message();
+        }
+    }
 
     match msg.type_ {
         MessageType::HEARTBEAT => handle_heartbeat(state, client_id).await,
@@ -40,62 +53,8 @@ async fn handle_heartbeat(state: &AppState, client_id: &str) {
     }
 }
 
-/// Manually serialize a relay message to JSON, avoiding serde overhead.
-/// Peer IDs are alphanumeric tokens (safe ASCII), so no JSON escaping needed.
-/// The payload is already valid JSON from RawValue.
 fn serialize_relay(msg: &Message) -> String {
-    let type_str = msg.type_.as_str();
-    let src = msg.src.as_deref().unwrap_or("");
-    let dst = msg.dst.as_deref().unwrap_or("");
-
-    // Estimate capacity: {"type":"TYPE","src":"...","dst":"...","payload":...,"seq":N,"room":"...","timestamp":N}
-    let payload_len = msg.payload.as_ref().map_or(0, |p| p.get().len());
-    let room_len = msg.room.as_ref().map_or(0, |r| r.len());
-    let capacity = 80 + type_str.len() + src.len() + dst.len() + payload_len + room_len;
-
-    let mut out = String::with_capacity(capacity);
-    out.push_str(r#"{"type":""#);
-    out.push_str(type_str);
-    out.push('"');
-
-    if !src.is_empty() {
-        out.push_str(r#","src":""#);
-        out.push_str(src);
-        out.push('"');
-    }
-
-    if !dst.is_empty() {
-        out.push_str(r#","dst":""#);
-        out.push_str(dst);
-        out.push('"');
-    }
-
-    if let Some(ref payload) = msg.payload {
-        out.push_str(r#","payload":"#);
-        out.push_str(payload.get());
-    }
-
-    if let Some(seq) = msg.seq {
-        out.push_str(r#","seq":"#);
-        // itoa-style manual number formatting for hot path
-        let mut buf = itoa::Buffer::new();
-        out.push_str(buf.format(seq));
-    }
-
-    if let Some(ref room) = msg.room {
-        out.push_str(r#","room":""#);
-        out.push_str(room);
-        out.push('"');
-    }
-
-    if let Some(ts) = msg.timestamp {
-        out.push_str(r#","timestamp":"#);
-        let mut buf = itoa::Buffer::new();
-        out.push_str(buf.format(ts));
-    }
-
-    out.push('}');
-    out
+    serde_json::to_string(msg).unwrap_or_default()
 }
 
 /// Transmission: route messages between peers.
@@ -126,20 +85,9 @@ async fn handle_transmission(state: &AppState, _client_id: &str, msg: Message) {
                 send_leave_to_source(state, dst_id, src_id).await;
             }
         } else {
-            // Destination not online in this instance.
-            // Check in-memory cache first (no Redis round-trip).
-            let exists = state.clients.contains_key(dst_id);
-
-            if exists {
-                // Client registered but not on this instance — queue the message.
-                if !matches!(msg_type, MessageType::LEAVE | MessageType::EXPIRE) {
-                    queue_message_raw(state, dst_id, &data).await;
-                }
-            } else {
-                // Destination truly offline — queue important messages.
-                if !matches!(msg_type, MessageType::LEAVE | MessageType::EXPIRE) {
-                    queue_message_raw(state, dst_id, &data).await;
-                }
+        // Dest not online in this instance — queue if not LEAVE/EXPIRE.
+            if !matches!(msg_type, MessageType::LEAVE | MessageType::EXPIRE) {
+                queue_message_raw(state, dst_id, &data).await;
             }
         }
     } else if msg_type == MessageType::LEAVE {
@@ -216,7 +164,7 @@ async fn handle_data(state: &AppState, client_id: &str, mut msg: Message) {
             .as_millis() as i64,
     );
 
-    tracing::debug!(src = %client_id, dst = ?msg.dst, room = ?msg.room, seq = ?msg.seq, "DATA relay");
+    tracing::debug!(src = %client_id, dst = ?msg.dst, room = %pii::redact_room(msg.room.as_deref().unwrap_or("")), seq = ?msg.seq, "DATA relay");
 
     let data = serialize_relay(&msg);
 
@@ -270,10 +218,12 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
             if let Some(rooms_array) = allowed_rooms.as_array() {
                 let room_allowed = rooms_array.iter().any(|r| r.as_str() == Some(&room_name));
                 if !room_allowed {
-                    let error =
-                        r#"{"type":"ERROR","payload":{"msg":"Not authorized to join this room"}}"#;
+                    let error = format!(
+                        r#"{{"type":"ROOM-JOIN-DENIED","room":"{}","reason":"auth_denied"}}"#,
+                        room_name
+                    );
                     if let Some(sender) = state.ws_senders.get(client_id) {
-                        let _ = sender.send(error.to_string());
+                        let _ = sender.send(error);
                     }
                     return;
                 }
@@ -288,9 +238,12 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
     if max_size > 0 {
         if let Some(members) = state.rooms.get(&room_name) {
             if members.len() >= max_size {
-                let error = r#"{"type":"ERROR","payload":{"msg":"Room is full"}}"#;
+                let error = format!(
+                    r#"{{"type":"ROOM-JOIN-DENIED","room":"{}","reason":"room_full"}}"#,
+                    room_name
+                );
                 if let Some(sender) = state.ws_senders.get(client_id) {
-                    let _ = sender.send(error.to_string());
+                    let _ = sender.send(error);
                 }
                 return;
             }
@@ -344,7 +297,8 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
     }
 
     tracing::info!(
-        "Client {client_id} joined room {room_name} ({} members)",
+        "Client {client_id} joined room {} ({} members)",
+        pii::redact_room(&room_name),
         members.len()
     );
 
@@ -364,7 +318,7 @@ async fn handle_presence_update(state: &AppState, client_id: &str, msg: Message)
         return;
     }
 
-    tracing::debug!(src = %client_id, room = %room_name, "Presence update");
+    tracing::debug!(src = %client_id, room = %pii::redact_room(&room_name), "Presence update");
 
     // Store presence data.
     if let Some(ref payload) = msg.payload {
@@ -401,7 +355,7 @@ async fn handle_room_leave(state: &AppState, client_id: &str, msg: Message) {
     }
 
     remove_client_from_room(state, client_id, &room_name);
-    tracing::info!("Client {client_id} left room {room_name}");
+    tracing::info!("Client {client_id} left room {}", pii::redact_room(&room_name));
 
     if let Some(ref webhook) = state.webhook {
         webhook.emit(WebhookEvent::room_left(client_id, &room_name));

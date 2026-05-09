@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use redis::aio::ConnectionManager;
@@ -40,6 +40,7 @@ pub enum TransportKind {
 pub struct ClientMeta {
     pub token: String,
     pub last_ping: AtomicI64,
+    pub last_message: AtomicI64,
     pub transport: TransportKind,
 }
 
@@ -48,6 +49,7 @@ impl ClientMeta {
         Self {
             token,
             last_ping: AtomicI64::new(now_ms()),
+            last_message: AtomicI64::new(now_ms()),
             transport: TransportKind::WebSocket,
         }
     }
@@ -56,6 +58,7 @@ impl ClientMeta {
         Self {
             token,
             last_ping: AtomicI64::new(now_ms()),
+            last_message: AtomicI64::new(now_ms()),
             transport,
         }
     }
@@ -64,8 +67,17 @@ impl ClientMeta {
         self.last_ping.store(now_ms(), Ordering::Relaxed);
     }
 
+    /// Mark that a non-heartbeat message was received — resets the idle timer.
+    pub fn record_message(&self) {
+        self.last_message.store(now_ms(), Ordering::Relaxed);
+    }
+
     pub fn last_ping_ms(&self) -> i64 {
         self.last_ping.load(Ordering::Relaxed)
+    }
+
+    pub fn last_message_ms(&self) -> i64 {
+        self.last_message.load(Ordering::Relaxed)
     }
 }
 
@@ -126,6 +138,28 @@ impl AppState {
         // saturating_sub via compare_exchange loop would be paranoid; a
         // bare fetch_sub is fine because reserve/release are paired.
         self.active_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub async fn drain_ws(&self, code: u16, reason: &str) -> usize {
+        let close_msg = format!(r#"{{"type":"CLOSE","code":{},"reason":"{}"}}"#, code, reason);
+        let ids: Vec<String> = self.ws_senders.iter().map(|e| e.key().clone()).collect();
+        for id in &ids {
+            if let Some(sender) = self.ws_senders.get(id) {
+                let _ = sender.send(close_msg.clone());
+            }
+        }
+        tracing::info!(count = ids.len(), "Sent CLOSE to all WebSocket clients");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if self.ws_senders.is_empty() {
+                return 0;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(remaining = self.ws_senders.len(), "WS drain timeout");
+                return self.ws_senders.len();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 

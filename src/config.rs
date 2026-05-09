@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
+use std::path::PathBuf;
+
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
@@ -12,21 +17,33 @@ pub struct Config {
     #[arg(short = 'H', long, default_value = "::")]
     pub host: String,
 
-    /// Connection key
-    #[arg(short, long, default_value = "dendri")]
+    /// Connection key (used if --key-file is not provided)
+    #[arg(short, long, default_value = "dendri", env = "DENDRI_KEY")]
     pub key: String,
+
+    /// Path to a file containing the connection key.
+    /// Overrides --key if both are set. More secure than --key
+    /// because it avoids exposing the secret in process listings.
+    #[arg(long, env = "DENDRI_KEY_FILE")]
+    pub key_file: Option<PathBuf>,
 
     /// URL path prefix
     #[arg(long, default_value = "/", env = "PEERSERVER_PATH")]
     pub path: String,
 
     /// Max simultaneous clients
-    #[arg(short, long, default_value_t = 5000)]
+    #[arg(short, long, default_value_t = 10000)]
     pub concurrent_limit: usize,
 
     /// Heartbeat timeout (milliseconds)
     #[arg(long, default_value_t = 60000)]
     pub alive_timeout: u64,
+
+    /// Idle timeout (milliseconds) — clients with no data/room messages for
+    /// this duration are evicted even if they are sending HEARTBEATs.
+    /// Defaults to 15 minutes (900000 ms). Set to 0 to disable.
+    #[arg(long, default_value_t = 900_000)]
+    pub idle_timeout: u64,
 
     /// Message queue expiration timeout (milliseconds)
     #[arg(short = 't', long, default_value_t = 5000)]
@@ -35,6 +52,13 @@ pub struct Config {
     /// Allow discovery of peers via GET /:key/peers
     #[arg(long, env = "DENDRI_ALLOW_DISCOVERY")]
     pub allow_discovery: bool,
+
+    /// Optional token required to call GET /:key/peers (in addition to --key).
+    /// When set, callers must pass ?token=<value> to the peers endpoint.
+    /// More secure than --allow_discovery alone because the discovery token
+    /// can be kept separate from the connection key.
+    #[arg(long, env = "DENDRI_DISCOVERY_TOKEN")]
+    pub discovery_token: Option<String>,
 
     /// Message cleanup interval (milliseconds)
     #[arg(long, default_value_t = 1000)]
