@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
 use reqwest::Client;
 use serde::Serialize;
 use std::time::Duration;
@@ -10,6 +13,15 @@ const WEBHOOK_QUEUE_CAPACITY: usize = 1024;
 /// Per-request HTTP timeout for webhook POSTs. A hung webhook endpoint
 /// otherwise blocks the delivery loop indefinitely.
 const WEBHOOK_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Webhook delivery retry configuration.
+/// 3 attempts total with exponential backoff: 1s, 5s, 25s.
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(25),
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WebhookEvent {
@@ -43,35 +55,60 @@ impl WebhookSender {
             while let Some(event) = rx.recv().await {
                 let payload = serde_json::to_string(&event).unwrap_or_default();
 
-                let mut request = client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("X-Dendri-Event", &event.event);
+                let mut last_error = None;
+                for attempt in 0..MAX_RETRIES {
+                    // Rebuild the request body for each attempt (reqwest consumes it).
+                    let mut req = client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .header("X-Dendri-Event", &event.event);
 
-                if let Some(ref secret) = secret {
-                    use hmac::{Hmac, Mac};
-                    use sha2::Sha256;
-                    let mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes());
-                    match mac {
-                        Ok(mut mac) => {
-                            mac.update(payload.as_bytes());
-                            let signature = hex::encode(mac.finalize().into_bytes());
-                            request = request
-                                .header("X-Dendri-Signature", format!("sha256={}", signature));
+                    if let Some(ref secret) = secret {
+                        use hmac::{Hmac, Mac};
+                        use sha2::Sha256;
+                        let mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes());
+                        match mac {
+                            Ok(mut mac) => {
+                                mac.update(payload.as_bytes());
+                                let signature = hex::encode(mac.finalize().into_bytes());
+                                req = req
+                                    .header("X-Dendri-Signature", format!("sha256={}", signature));
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Webhook HMAC init failed");
+                                continue;
+                            }
+                        }
+                    }
+
+                    match req.body(payload.clone()).send().await {
+                        Ok(_) => {
+                            last_error = None;
+                            break;
                         }
                         Err(e) => {
-                            // Don't panic — HMAC failure here shouldn't kill
-                            // the delivery loop for all future events.
-                            tracing::error!(error = %e, "Webhook HMAC init failed");
-                            continue;
+                            last_error = Some(e);
+                            if attempt + 1 < MAX_RETRIES {
+                                tracing::warn!(
+                                    event = %event.event,
+                                    attempt = attempt + 1,
+                                    error = %last_error.as_ref().unwrap(),
+                                    retry_in_ms = RETRY_DELAYS[attempt as usize].as_millis(),
+                                    "Webhook delivery failed, retrying"
+                                );
+                                tokio::time::sleep(RETRY_DELAYS[attempt as usize]).await;
+                            }
                         }
                     }
                 }
 
-                // Fire and forget (timeout already applied by the client
-                // builder above) -- don't block the event loop.
-                if let Err(e) = request.body(payload).send().await {
-                    tracing::warn!(event = %event.event, error = %e, "Webhook delivery failed");
+                if let Some(e) = last_error {
+                    tracing::error!(
+                        event = %event.event,
+                        attempts = MAX_RETRIES,
+                        error = %e,
+                        "Webhook delivery failed after all retries"
+                    );
                 }
             }
         });
@@ -116,23 +153,49 @@ pub fn is_safe_webhook_url(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    // Block loopback, link-local, and the AWS/GCP metadata IP.
+    // Block loopback, link-local, unique-local, and the AWS/GCP metadata IP.
     const BLOCKED_LITERALS: &[&str] = &[
+        // IPv4
         "localhost",
         "127.0.0.1",
         "0.0.0.0",
-        "::1",
         "169.254.169.254",
+        // IPv6 loopback, link-local, unique-local (ULA), and cloud metadata
+        "::1",
+        "fd00::",
+        "fe80::",
     ];
+    let prefix_blocks: &[&str] = &[
+        "127.",     // IPv4 loopback
+        "fc00:",    // ULA lower half
+        "fd00:",    // ULA upper half
+        "fe80:",    // IPv6 link-local
+        "10.",      // RFC 1918 private
+        "172.16.",  // RFC 1918 private range start (172.16.0.0/12)
+        "192.168.", // RFC 1918 private
+    ];
+
     if BLOCKED_LITERALS
         .iter()
         .any(|b| host.eq_ignore_ascii_case(b))
     {
         return false;
     }
-    // Loopback range as a prefix check (covers 127.x.y.z).
-    if host.starts_with("127.") {
+    if prefix_blocks
+        .iter()
+        .any(|p| host.len() >= p.len() && host[..p.len()].eq_ignore_ascii_case(p))
+    {
         return false;
+    }
+    // Check the broader 172.16.0.0/12 private range (172.16.0.0 - 172.31.255.255).
+    if host.len() >= 7 && host.starts_with("172.") {
+        if let Some(second) = host[4..].split('.').next() {
+            if let Ok(n) = second.parse::<u8>() {
+                if (16..=31).contains(&n) {
+                    return false;
+                }
+            }
+        }
     }
     true
 }

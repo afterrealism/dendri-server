@@ -90,14 +90,7 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
 
     // Check if client already exists (reconnection scenario).
     // Try in-memory cache first, fall back to Redis.
-    let existing_token = state
-        .clients
-        .get(&id)
-        .map(|meta| meta.token.clone())
-        .or_else(|| {
-            // Not in cache — will check Redis below.
-            None
-        });
+    let existing_token = state.clients.get(&id).map(|meta| meta.token.clone());
 
     // If not in memory, check Redis (may exist from a previous process).
     let existing_token = match existing_token {
@@ -125,7 +118,7 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
             .unwrap_or_default();
 
             let (mut sink, _) = socket.split();
-            let _ = futures::SinkExt::send(&mut sink, WsMessage::Text(id_taken.into())).await;
+            let _ = futures::SinkExt::send(&mut sink, WsMessage::Text(id_taken)).await;
             let _ = futures::SinkExt::close(&mut sink).await;
             return;
         }
@@ -157,7 +150,7 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
         // New client — atomically reserve a connection slot to avoid the
         // TOCTOU race where two concurrent connects both pass the limit
         // check and then both insert.
-        if !state.try_reserve_connection_slot(state.config.concurrent_limit as usize) {
+        if !state.try_reserve_connection_slot(state.config.concurrent_limit) {
             send_error_and_close(socket, &PeerError::ConnectionLimitExceed).await;
             return;
         }
@@ -205,7 +198,7 @@ async fn run_client(
         use futures::SinkExt;
         let mut sink = sink;
         while let Some(msg) = rx.recv().await {
-            if sink.send(WsMessage::Text(msg.into())).await.is_err() {
+            if sink.send(WsMessage::Text(msg)).await.is_err() {
                 break;
             }
         }
@@ -310,7 +303,14 @@ async fn run_client(
                                 MessageType::DATA => "data",
                                 _ => "signaling",
                             };
-                            tracing::warn!("Rate limit exceeded for {client_id} ({:?})", msg.type_);
+                            let limit = if bucket == "data" { rate_limit_data } else { rate_limit_signaling };
+                            tracing::warn!(
+                                client_id = %client_id,
+                                bucket = %bucket,
+                                limit = limit,
+                                msg_type = ?msg.type_,
+                                "Rate limit exceeded"
+                            );
                             if let Some(ref webhook) = state_clone.webhook {
                                 webhook.emit(WebhookEvent::rate_limited(&client_id, bucket));
                             }
@@ -393,7 +393,7 @@ async fn deliver_queued_messages(state: &AppState, id: &str, tx: &mpsc::Unbounde
 async fn send_error_and_close(socket: WebSocket, error: &PeerError) {
     let (mut sink, _) = socket.split();
     let error_json = make_error_json(error);
-    let _ = futures::SinkExt::send(&mut sink, WsMessage::Text(error_json.into())).await;
+    let _ = futures::SinkExt::send(&mut sink, WsMessage::Text(error_json)).await;
     let _ = futures::SinkExt::close(&mut sink).await;
 }
 

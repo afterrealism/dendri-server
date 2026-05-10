@@ -32,7 +32,7 @@ pub type PollingReceiver = Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
     WebSocket,
-    SSE,
+    Sse,
     Polling,
 }
 
@@ -41,6 +41,7 @@ pub struct ClientMeta {
     pub token: String,
     pub last_ping: AtomicI64,
     pub last_message: AtomicI64,
+    #[allow(dead_code)]
     pub transport: TransportKind,
 }
 
@@ -141,7 +142,10 @@ impl AppState {
     }
 
     pub async fn drain_ws(&self, code: u16, reason: &str) -> usize {
-        let close_msg = format!(r#"{{"type":"CLOSE","code":{},"reason":"{}"}}"#, code, reason);
+        let close_msg = format!(
+            r#"{{"type":"CLOSE","code":{},"reason":"{}"}}"#,
+            code, reason
+        );
         let ids: Vec<String> = self.ws_senders.iter().map(|e| e.key().clone()).collect();
         for id in &ids {
             if let Some(sender) = self.ws_senders.get(id) {

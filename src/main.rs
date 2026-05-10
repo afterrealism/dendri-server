@@ -26,6 +26,8 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::trace::TraceLayer;
+use tracing::Span;
 
 use config::Config;
 use state::AppState;
@@ -147,6 +149,33 @@ async fn main() {
             )
         })
         .layer(cors)
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        version = ?request.version(),
+                    )
+                })
+                .on_request(|request: &axum::http::Request<_>, _span: &Span| {
+                    tracing::info!(
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        "-> incoming request"
+                    );
+                })
+                .on_response(
+                    |response: &axum::http::Response<_>, latency: std::time::Duration, _span: &Span| {
+                        tracing::info!(
+                            status = response.status().as_u16(),
+                            latency_ms = latency.as_millis(),
+                            "<- response"
+                        );
+                    },
+                ),
+        )
         .with_state(state.clone());
 
     // HSTS: only active when TLS is configured.

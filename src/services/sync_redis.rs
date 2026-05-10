@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -25,8 +28,12 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
 
         let alive_timeout = state.config.alive_timeout;
 
-        for entry in state.clients.iter() {
-            let id = entry.key();
+        // Collect keys first to avoid holding DashMap shard locks across await points.
+        // DashMap::iter() holds an internal shard lock — if we await while holding it,
+        // other operations on that shard (like client insertions/removals) are blocked.
+        let ids: Vec<String> = state.clients.iter().map(|e| e.key().clone()).collect();
+
+        for id in &ids {
             if let Err(e) = redis_realm::set_last_ping(&state.redis, id, alive_timeout).await {
                 tracing::warn!("sync_redis: failed to update last_ping for {id}: {e}");
             }

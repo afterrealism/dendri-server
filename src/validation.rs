@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
 //! Input validation for user-supplied identifiers and constant-time
 //! comparison helpers for shared secrets.
 //!
 //! Peer IDs, tokens, and room names flow into hand-built JSON in the message
-//! serializer (see `handlers::message::serialize_relay`) and into storage keys.
+//! serializer and into storage keys.
 //! Treating them as "safe ASCII" is only safe if we enforce the constraint at
 //! the boundary — that is this module's job.
 

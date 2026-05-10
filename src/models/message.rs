@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 

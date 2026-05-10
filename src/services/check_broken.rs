@@ -78,9 +78,11 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
 
         // Periodic reconciliation: reset the atomic counter to the actual
         // client count in case the counter has drifted due to edge cases.
-        if tick % RECONCILE_TICKS == 0 {
+        if tick.is_multiple_of(RECONCILE_TICKS) {
             let actual = state.clients.len();
-            let counter = state.active_connections.load(std::sync::atomic::Ordering::SeqCst);
+            let counter = state
+                .active_connections
+                .load(std::sync::atomic::Ordering::SeqCst);
             if actual != counter {
                 tracing::warn!(
                     actual,

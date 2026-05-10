@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 
@@ -55,17 +58,6 @@ pub async fn get_client_token(
     conn.hget(&client_key, "token").await
 }
 
-/// Get a client's last_ping timestamp from Redis.
-pub async fn get_client_last_ping(
-    conn: &ConnectionManager,
-    id: &str,
-) -> redis::RedisResult<Option<i64>> {
-    let mut conn = conn.clone();
-    let client_key = format!("peer:client:{id}");
-    let val: Option<String> = conn.hget(&client_key, "last_ping").await?;
-    Ok(val.and_then(|v| v.parse::<i64>().ok()))
-}
-
 /// Update a client's last_ping and refresh the TTL.
 pub async fn set_last_ping(
     conn: &ConnectionManager,
@@ -83,12 +75,6 @@ pub async fn set_last_ping(
         .await?;
 
     Ok(())
-}
-
-/// Return the number of connected clients.
-pub async fn client_count(conn: &ConnectionManager) -> redis::RedisResult<usize> {
-    let mut conn = conn.clone();
-    conn.scard("peer:clients").await
 }
 
 /// Return all connected client IDs.

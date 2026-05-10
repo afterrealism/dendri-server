@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::enums::{MessageType, PeerError};
-use crate::pii;
 use crate::models::message::Message;
+use crate::pii;
 use crate::redis_realm;
 use crate::state::{AppState, PendingRemoval};
 use crate::validation::is_valid_identifier;
@@ -85,7 +85,7 @@ async fn handle_transmission(state: &AppState, _client_id: &str, msg: Message) {
                 send_leave_to_source(state, dst_id, src_id).await;
             }
         } else {
-        // Dest not online in this instance — queue if not LEAVE/EXPIRE.
+            // Dest not online in this instance — queue if not LEAVE/EXPIRE.
             if !matches!(msg_type, MessageType::LEAVE | MessageType::EXPIRE) {
                 queue_message_raw(state, dst_id, &data).await;
             }
@@ -355,7 +355,10 @@ async fn handle_room_leave(state: &AppState, client_id: &str, msg: Message) {
     }
 
     remove_client_from_room(state, client_id, &room_name);
-    tracing::info!("Client {client_id} left room {}", pii::redact_room(&room_name));
+    tracing::info!(
+        "Client {client_id} left room {}",
+        pii::redact_room(&room_name)
+    );
 
     if let Some(ref webhook) = state.webhook {
         webhook.emit(WebhookEvent::room_left(client_id, &room_name));

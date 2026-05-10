@@ -85,7 +85,7 @@ pub struct Config {
     pub max_message_size: usize,
 
     /// Signaling messages per second per client
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 50)]
     pub rate_limit_signaling: u32,
 
     /// Data messages per second per client

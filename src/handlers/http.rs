@@ -71,7 +71,7 @@ pub async fn sse_handler(
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     // Register in the same DashMaps used by WebSocket clients.
-    let meta = ClientMeta::with_transport(token, TransportKind::SSE);
+    let meta = ClientMeta::with_transport(token, TransportKind::Sse);
     state.clients.insert(id.clone(), meta);
     state.ws_senders.insert(id.clone(), tx.clone());
 
@@ -198,7 +198,13 @@ fn apply_rate_limit(state: &AppState, client_id: &str, msg: &Message) -> bool {
         .rate_limiter
         .check_and_consume(client_id, bucket, limit);
     if !allowed {
-        tracing::warn!("HTTP rate limit exceeded for {client_id} ({:?})", msg.type_);
+        tracing::warn!(
+            client_id = %client_id,
+            bucket = %bucket,
+            limit = limit,
+            msg_type = ?msg.type_,
+            "HTTP rate limit exceeded"
+        );
         if let Some(ref webhook) = state.webhook {
             webhook.emit(WebhookEvent::rate_limited(client_id, bucket));
         }
@@ -325,25 +331,6 @@ pub async fn poll_handler(
     Json(messages).into_response()
 }
 
-/// Collect messages from a one-shot owned receiver (test helper).
-async fn collect_poll_messages(mut rx: mpsc::UnboundedReceiver<String>) -> Vec<String> {
-    let mut messages = Vec::new();
-    let timeout = tokio::time::Duration::from_secs(25);
-
-    match tokio::time::timeout(timeout, rx.recv()).await {
-        Ok(Some(msg)) => {
-            messages.push(msg);
-            while let Ok(msg) = rx.try_recv() {
-                messages.push(msg);
-            }
-        }
-        Ok(None) => {}
-        Err(_) => {}
-    }
-
-    messages
-}
-
 /// Drain the persistent polling receiver shared across poll requests.
 /// Waits up to 25 seconds for the first message then drains anything else
 /// that is immediately ready. Cap the batch to a reasonable upper bound so
@@ -356,17 +343,14 @@ async fn collect_poll_messages_shared(
     let timeout = tokio::time::Duration::from_secs(25);
     let mut guard = receiver.lock().await;
 
-    match tokio::time::timeout(timeout, guard.recv()).await {
-        Ok(Some(msg)) => {
-            messages.push(msg);
-            while messages.len() < MAX_BATCH {
-                match guard.try_recv() {
-                    Ok(msg) => messages.push(msg),
-                    Err(_) => break,
-                }
+    if let Ok(Some(msg)) = tokio::time::timeout(timeout, guard.recv()).await {
+        messages.push(msg);
+        while messages.len() < MAX_BATCH {
+            match guard.try_recv() {
+                Ok(msg) => messages.push(msg),
+                Err(_) => break,
             }
         }
-        Ok(None) | Err(_) => {}
     }
 
     messages
