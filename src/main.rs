@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2025-2026 Dendri contributors
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -5,6 +8,7 @@ mod config;
 mod enums;
 mod handlers;
 mod models;
+mod pii;
 mod rate_limiter;
 mod redis_realm;
 mod replay_buffer;
@@ -18,6 +22,7 @@ use std::net::SocketAddr;
 use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -27,6 +32,23 @@ use state::AppState;
 
 #[tokio::main]
 async fn main() {
+    // Panic hook emits structured tracing so panics in background tasks
+    // are captured with context instead of disappearing silently.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("unknown");
+        tracing::error!(panic.location = %location, panic.msg = %msg, "Panic");
+        eprintln!("FATAL: {} at {}", msg, location);
+    }));
+
     // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -35,7 +57,35 @@ async fn main() {
         )
         .init();
 
-    let config = Config::parse();
+    // Initialize Prometheus metrics recorder.
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("Failed to install Prometheus recorder");
+
+    let config = {
+        let mut c = Config::parse();
+
+        // If --key-file is provided, read the key from the file,
+        // overriding any value from --key or DENDRI_KEY env var.
+        if let Some(ref path) = c.key_file {
+            match std::fs::read_to_string(path) {
+                Ok(mut key) => {
+                    key.truncate(key.trim_end().len());
+                    if key.is_empty() {
+                        eprintln!("Key file {path:?} is empty");
+                        std::process::exit(1);
+                    }
+                    c.key = key;
+                }
+                Err(e) => {
+                    eprintln!("Failed to read key file {path:?}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        c
+    };
 
     let host = config.host.clone();
     let port = config.port;
@@ -60,8 +110,16 @@ async fn main() {
 
     // Build router.
     // axum 0.7 uses `:param` syntax for path parameters.
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(handlers::api::health))
+        .route(
+            "/metrics",
+            get(move || {
+                let handle = prometheus_handle.clone();
+                async move { handle.render() }
+            }),
+        )
+        .route("/turn", get(handlers::api::turn_credentials_root))
         .route(&format!("{base}/"), get(handlers::api::root))
         .route(&format!("{base}/:key/id"), get(handlers::api::get_id))
         .route(&format!("{base}/:key/peers"), get(handlers::api::get_peers))
@@ -82,8 +140,31 @@ async fn main() {
             &format!("{base}/http/poll"),
             get(handlers::http::poll_handler),
         )
+        .fallback(|| async {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": "Not Found"})),
+            )
+        })
         .layer(cors)
         .with_state(state.clone());
+
+    // HSTS: only active when TLS is configured.
+    if sslkey.is_some() {
+        use axum::http::header::STRICT_TRANSPORT_SECURITY;
+        use axum::http::HeaderValue;
+        let hsts = HeaderValue::from_static("max-age=31536000; includeSubDomains");
+        app = app.layer(axum::middleware::from_fn(
+            move |_req, next: axum::middleware::Next| {
+                let hsts = hsts.clone();
+                async move {
+                    let mut resp = next.run(_req).await;
+                    resp.headers_mut().insert(STRICT_TRANSPORT_SECURITY, hsts);
+                    resp
+                }
+            },
+        ));
+    }
 
     // Shutdown channel for background services.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -109,6 +190,9 @@ async fn main() {
     } else {
         run_plain(app, &host, port, &user_path).await;
     }
+
+    // Graceful WS drain: send CLOSE to all live clients, wait up to 30 s.
+    let _ = state.drain_ws(4001, "shutting-down").await;
 
     // Signal shutdown to background tasks.
     let _ = shutdown_tx.send(true);
@@ -159,6 +243,31 @@ async fn run_tls(
             eprintln!("Failed to load TLS certificates: {e}");
             std::process::exit(1);
         });
+
+    // SIGHUP handler: reload TLS certificates from disk without restarting.
+    #[cfg(unix)]
+    {
+        let reload_config = tls_config.clone();
+        let reload_key = key_path.to_string();
+        let reload_cert = cert_path.to_string();
+        tokio::spawn(async move {
+            let Ok(mut sighup) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            else {
+                return;
+            };
+            loop {
+                sighup.recv().await;
+                tracing::info!("SIGHUP received, reloading TLS certificates");
+                if let Err(e) = reload_config
+                    .reload_from_pem_file(&reload_cert, &reload_key)
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to reload TLS certificates");
+                }
+            }
+        });
+    }
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -215,11 +324,31 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn build_cors(origins: &[String]) -> CorsLayer {
-    if origins.is_empty() {
-        // Default: mirror origin (allow all).
-        CorsLayer::permissive()
+    use axum::http::HeaderValue;
+    use axum::http::Method;
+
+    let explicit: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
+
+    let cors = if explicit.is_empty() {
+        // No origins configured: allow all *.dendri.dev subdomains by default
+        // so that example apps at chat.dendri.dev, cursors.dendri.dev, etc.
+        // can reach the signaling server without explicit per-origin config.
+        CorsLayer::new().allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+            let s = origin.as_bytes();
+            s.ends_with(b".dendri.dev")
+                || s == b"https://dendri.dev"
+                || s == b"http://localhost:5173"
+        }))
     } else {
-        let allowed: Vec<_> = origins.iter().filter_map(|o| o.parse().ok()).collect();
-        CorsLayer::new().allow_origin(AllowOrigin::list(allowed))
-    }
+        CorsLayer::new().allow_origin(AllowOrigin::list(explicit))
+    };
+
+    cors.allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::ACCEPT,
+        ])
+        .allow_credentials(true)
+        .max_age(std::time::Duration::from_secs(3600))
 }
