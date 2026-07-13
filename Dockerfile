@@ -6,7 +6,7 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y ca-certificates \
+    && apt-get install -y ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/dendri /usr/local/bin/dendri
 RUN groupadd --gid 1001 dendri && useradd --uid 1001 --gid dendri --shell /usr/sbin/nologin dendri
