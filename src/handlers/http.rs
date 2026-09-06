@@ -28,6 +28,8 @@ pub struct HttpQuery {
     pub last_seq: Option<u64>,
     /// Tenant API key (hosted/multi-tenant deployments).
     pub api_key: Option<String>,
+    /// Per-connection JWT (HS256), enforced when an effective secret is set.
+    pub jwt: Option<String>,
 }
 
 /// GET /http/sse -- Server-Sent Events stream for receiving messages.
@@ -53,10 +55,10 @@ pub async fn sse_handler(
     }
 
     // Tenant resolution (hosted mode) — same contract as the WS handler.
-    let tenant_id = match params.api_key.as_deref() {
+    let resolved_tenant = match params.api_key.as_deref() {
         Some(api_key) => {
             match crate::tenant::resolve_api_key(&state.redis, &state.tenant_cache, api_key).await {
-                Some(tenant) => Some(tenant.id),
+                Some(tenant) => Some(tenant),
                 None => return Err((StatusCode::UNAUTHORIZED, "Invalid api_key")),
             }
         }
@@ -67,6 +69,16 @@ pub async fn sse_handler(
             None
         }
     };
+    let tenant_id = resolved_tenant.as_ref().map(|t| t.id.clone());
+
+    // Same JWT rule as the WS transport — the HTTP fallback must not be a
+    // back door around the room ACL.
+    if super::enforce_jwt(&state, resolved_tenant.as_ref(), params.jwt.as_deref(), &id)
+        .await
+        .is_err()
+    {
+        return Err((StatusCode::FORBIDDEN, "Invalid token"));
+    }
 
     // Handle reconnection: validate token if client already exists.
     let is_new_client = !state.clients.contains_key(&id);
@@ -258,10 +270,10 @@ pub async fn poll_handler(
     }
 
     // Tenant resolution (hosted mode) — same contract as the WS handler.
-    let tenant_id = match params.api_key.as_deref() {
+    let resolved_tenant = match params.api_key.as_deref() {
         Some(api_key) => {
             match crate::tenant::resolve_api_key(&state.redis, &state.tenant_cache, api_key).await {
-                Some(tenant) => Some(tenant.id),
+                Some(tenant) => Some(tenant),
                 None => {
                     return (
                         StatusCode::UNAUTHORIZED,
@@ -282,6 +294,20 @@ pub async fn poll_handler(
             None
         }
     };
+    let tenant_id = resolved_tenant.as_ref().map(|t| t.id.clone());
+
+    // Same JWT rule as the WS transport — the HTTP fallback must not be a
+    // back door around the room ACL.
+    if super::enforce_jwt(&state, resolved_tenant.as_ref(), params.jwt.as_deref(), &id)
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Invalid token"})),
+        )
+            .into_response();
+    }
 
     let is_new_client = !state.clients.contains_key(&id);
 

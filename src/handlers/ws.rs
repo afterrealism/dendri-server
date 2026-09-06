@@ -84,34 +84,14 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
     };
     let tenant_id = resolved_tenant.as_ref().map(|t| t.id.clone());
 
-    // Optional JWT validation — enforced when the effective secret (per-tenant
-    // first, then global) is configured for this connection.
-    let effective_secret = crate::jwt::effective_jwt_secret(
-        resolved_tenant
-            .as_ref()
-            .and_then(|t| t.jwt_secret.as_deref()),
-        state.config.jwt_secret.as_deref(),
-    );
-    if let Some(secret) = effective_secret {
-        let jwt_token = params.jwt.as_deref().unwrap_or("");
-        match crate::jwt::validate_jwt(secret, jwt_token) {
-            Ok(claims) => {
-                if let Some(ref t) = resolved_tenant {
-                    if !crate::jwt::tid_matches(&claims, &t.id) {
-                        tracing::warn!(client = %id, tenant = %t.id, "JWT tid mismatch");
-                        send_error_and_close(socket, &PeerError::InvalidToken).await;
-                        return;
-                    }
-                }
-                tracing::debug!(client = %id, claims = ?claims, "JWT validated");
-                state.client_claims.insert(id.clone(), claims);
-            }
-            Err(e) => {
-                tracing::warn!(client = %id, error = %e, "JWT validation failed");
-                send_error_and_close(socket, &PeerError::InvalidToken).await;
-                return;
-            }
-        }
+    // Optional JWT validation — enforced when the effective secret
+    // (per-tenant first, then global) is configured for this connection.
+    if super::enforce_jwt(&state, resolved_tenant.as_ref(), params.jwt.as_deref(), &id)
+        .await
+        .is_err()
+    {
+        send_error_and_close(socket, &PeerError::InvalidToken).await;
+        return;
     }
 
     // Check if client already exists (reconnection scenario).
