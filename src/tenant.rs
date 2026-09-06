@@ -83,6 +83,12 @@ pub fn generate_api_key() -> String {
     format!("dk_{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Generate a new JWT secret: `jwt_` + 32 hex chars (~122 bits of entropy).
+/// Unlike API keys this must be stored in plaintext — HMAC verification needs it.
+pub fn generate_jwt_secret() -> String {
+    format!("jwt_{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Generate a short tenant id: `t_` + 12 hex chars.
 pub fn generate_tenant_id() -> String {
     let simple = uuid::Uuid::new_v4().simple().to_string();
@@ -173,6 +179,20 @@ pub async fn create_tenant(
     }
     let _: () = pipe.query_async(&mut conn).await?;
     Ok(())
+}
+
+/// Persist an already-stored tenant after a mutation (e.g. JWT secret
+/// rotation). Looks up the existing API-key hash via the id index so the
+/// plaintext key is not needed. Returns false when the id is unknown.
+pub async fn update_tenant(redis: &ConnectionManager, tenant: &Tenant) -> redis::RedisResult<bool> {
+    let mut conn = redis.clone();
+    let hash: Option<String> = conn.get(key_by_id(&tenant.id)).await?;
+    let Some(hash) = hash else {
+        return Ok(false);
+    };
+    let json = serde_json::to_string(tenant).unwrap_or_default();
+    let _: () = conn.set(key_by_hash(&hash), json).await?;
+    Ok(true)
 }
 
 /// Resolve a login email to a tenant id (dashboard magic-link).
@@ -288,6 +308,14 @@ mod tests {
         // Tenant ids must satisfy the identifier charset — they may be used
         // as internal namespace prefixes.
         assert!(crate::validation::is_valid_identifier(&id));
+    }
+
+    #[test]
+    fn generated_jwt_secret_has_expected_shape() {
+        let secret = generate_jwt_secret();
+        assert!(secret.starts_with("jwt_"));
+        assert_eq!(secret.len(), 4 + 32);
+        assert_ne!(secret, generate_jwt_secret());
     }
 
     #[test]
