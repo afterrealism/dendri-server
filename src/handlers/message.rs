@@ -12,6 +12,38 @@ use crate::state::{AppState, PendingRemoval};
 use crate::validation::is_valid_identifier;
 use crate::webhook::WebhookEvent;
 
+/// Separator between a tenant prefix and the client-visible room name in
+/// storage keys. `\x1f` (ASCII unit separator) can never appear in a valid
+/// identifier, so no client-supplied room name can forge a tenant boundary.
+const TENANT_SEP: char = '\u{1f}';
+
+/// Storage key for a room, namespaced by tenant when the client authenticated
+/// with an API key. Self-host clients (no tenant) use the bare room name, so
+/// their behaviour is unchanged. This is what makes two tenants' identically
+/// named rooms distinct in every shared map (rooms, presence, replay).
+pub fn room_key(state: &AppState, client_id: &str, room: &str) -> String {
+    let tenant = state.client_tenants.get(client_id);
+    namespace_room(tenant.as_ref().map(|t| t.value().as_str()), room)
+}
+
+/// Pure namespacing: `Some(tenant)` → `tenant\x1froom`, `None` → `room`.
+pub fn namespace_room(tenant: Option<&str>, room: &str) -> String {
+    match tenant {
+        Some(tenant) => format!("{tenant}{TENANT_SEP}{room}"),
+        None => room.to_string(),
+    }
+}
+
+/// The client-facing room name for a stored key (strips any tenant prefix).
+/// Used only where a room name is echoed to clients from a stored key rather
+/// than from the inbound message.
+pub fn room_display(key: &str) -> &str {
+    match key.split_once(TENANT_SEP) {
+        Some((_, name)) => name,
+        None => key,
+    }
+}
+
 /// Handle an incoming message from a client.
 /// Dispatches to heartbeat, transmission, relay, or room operations based on message type.
 pub async fn handle_message(state: &AppState, client_id: &str, mut msg: Message) {
@@ -169,8 +201,10 @@ async fn handle_data(state: &AppState, client_id: &str, mut msg: Message) {
     let data = serialize_relay(&msg);
 
     if let Some(ref room_name) = msg.room {
-        // Room fan-out: send to all members except sender.
-        if let Some(members) = state.rooms.get(room_name) {
+        // Room fan-out: send to all members except sender. Keyed by the
+        // tenant-namespaced room so DATA never crosses tenants.
+        let key = room_key(state, client_id, room_name);
+        if let Some(members) = state.rooms.get(&key) {
             for member_id in members.iter() {
                 if member_id.as_str() != client_id {
                     if let Some(sender) = state.ws_senders.get(member_id.as_str()) {
@@ -181,7 +215,7 @@ async fn handle_data(state: &AppState, client_id: &str, mut msg: Message) {
         }
         // H6: Ephemeral messages skip replay buffer (cursor/typing)
         if msg.topic_class.as_deref() != Some("ephemeral") {
-            state.replay_buffer.push(room_name, seq, data);
+            state.replay_buffer.push(&key, seq, data);
         }
     } else if let Some(ref dst_id) = msg.dst {
         // Point-to-point relay.
@@ -233,10 +267,57 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
     }
     // If no claims at all (no JWT), all rooms are allowed (backward compat).
 
+    // Tenant-namespaced storage key. All map access below uses this; the
+    // client-visible `room_name` is still echoed in responses.
+    let room_stored = room_key(state, client_id, &room_name);
+
+    // Cap rooms per client and distinct rooms server-wide (0 = unlimited).
+    // Without these, a single client looping ROOM-JOIN with fresh names grows
+    // the room maps without bound — a memory-exhaustion DoS on shared state.
+    let already_member = state
+        .client_rooms
+        .get(client_id)
+        .map(|rooms| rooms.contains(&room_stored))
+        .unwrap_or(false);
+    if !already_member {
+        let max_per_client = state.config.max_rooms_per_client;
+        if max_per_client > 0 {
+            let joined = state
+                .client_rooms
+                .get(client_id)
+                .map(|rooms| rooms.len())
+                .unwrap_or(0);
+            if joined >= max_per_client {
+                let error = format!(
+                    r#"{{"type":"ROOM-JOIN-DENIED","room":"{}","reason":"client_room_limit"}}"#,
+                    room_name
+                );
+                if let Some(sender) = state.ws_senders.get(client_id) {
+                    let _ = sender.send(error);
+                }
+                return;
+            }
+        }
+        let max_total = state.config.max_total_rooms;
+        if max_total > 0
+            && !state.rooms.contains_key(&room_stored)
+            && state.rooms.len() >= max_total
+        {
+            let error = format!(
+                r#"{{"type":"ROOM-JOIN-DENIED","room":"{}","reason":"server_room_limit"}}"#,
+                room_name
+            );
+            if let Some(sender) = state.ws_senders.get(client_id) {
+                let _ = sender.send(error);
+            }
+            return;
+        }
+    }
+
     // Enforce max_room_size (0 means unlimited).
     let max_size = state.config.max_room_size;
     if max_size > 0 {
-        if let Some(members) = state.rooms.get(&room_name) {
+        if let Some(members) = state.rooms.get(&room_stored) {
             if members.len() >= max_size {
                 let error = format!(
                     r#"{{"type":"ROOM-JOIN-DENIED","room":"{}","reason":"room_full"}}"#,
@@ -253,7 +334,7 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
     // Add client to room.
     state
         .rooms
-        .entry(room_name.clone())
+        .entry(room_stored.clone())
         .or_default()
         .insert(client_id.to_string());
 
@@ -262,12 +343,12 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
         .client_rooms
         .entry(client_id.to_string())
         .or_default()
-        .insert(room_name.clone());
+        .insert(room_stored.clone());
 
     // Build member list.
     let members: Vec<String> = state
         .rooms
-        .get(&room_name)
+        .get(&room_stored)
         .map(|m| m.iter().cloned().collect())
         .unwrap_or_default();
 
@@ -282,7 +363,7 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
     }
 
     // Send existing presence data to the new joiner.
-    if let Some(room_presence) = state.presence.get(&room_name) {
+    if let Some(room_presence) = state.presence.get(&room_stored) {
         for entry in room_presence.iter() {
             let presence_msg = format!(
                 r#"{{"type":"PRESENCE-UPDATE","src":"{}","room":"{}","payload":{}}}"#,
@@ -320,18 +401,20 @@ async fn handle_presence_update(state: &AppState, client_id: &str, msg: Message)
 
     tracing::debug!(src = %client_id, room = %pii::redact_room(&room_name), "Presence update");
 
+    let room_stored = room_key(state, client_id, &room_name);
+
     // Store presence data.
     if let Some(ref payload) = msg.payload {
         state
             .presence
-            .entry(room_name.clone())
+            .entry(room_stored.clone())
             .or_default()
             .insert(client_id.to_string(), payload.get().to_string());
     }
 
     // Fan-out to all room members (except sender).
     let data = serialize_relay(&msg);
-    if let Some(members) = state.rooms.get(&room_name) {
+    if let Some(members) = state.rooms.get(&room_stored) {
         for member_id in members.iter() {
             if member_id.as_str() != client_id {
                 if let Some(sender) = state.ws_senders.get(member_id.as_str()) {
@@ -354,7 +437,8 @@ async fn handle_room_leave(state: &AppState, client_id: &str, msg: Message) {
         return;
     }
 
-    remove_client_from_room(state, client_id, &room_name);
+    let room_stored = room_key(state, client_id, &room_name);
+    remove_client_from_room(state, client_id, &room_stored);
     tracing::info!(
         "Client {client_id} left room {}",
         pii::redact_room(&room_name)
@@ -367,10 +451,16 @@ async fn handle_room_leave(state: &AppState, client_id: &str, msg: Message) {
 
 /// Remove a client from a specific room and notify remaining members.
 /// Deletes the room if it becomes empty.
-pub fn remove_client_from_room(state: &AppState, client_id: &str, room_name: &str) {
+///
+/// `room_key` is the stored (possibly tenant-namespaced) key. Room names
+/// echoed to clients are stripped back to their display form.
+pub fn remove_client_from_room(state: &AppState, client_id: &str, stored_key: &str) {
+    // Map access uses the stored (namespaced) key; client echoes use the
+    // stripped display name.
+    let display_name = room_display(stored_key);
     // Remove from room member set.
     let room_empty = {
-        if let Some(mut members) = state.rooms.get_mut(room_name) {
+        if let Some(mut members) = state.rooms.get_mut(stored_key) {
             members.remove(client_id);
             members.is_empty()
         } else {
@@ -379,23 +469,23 @@ pub fn remove_client_from_room(state: &AppState, client_id: &str, room_name: &st
     };
 
     // Clean up presence data for this client.
-    if let Some(room_presence) = state.presence.get(room_name) {
+    if let Some(room_presence) = state.presence.get(stored_key) {
         room_presence.remove(client_id);
     }
 
     if room_empty {
-        state.rooms.remove(room_name);
+        state.rooms.remove(stored_key);
         // Clean up the presence map for the empty room.
-        state.presence.remove(room_name);
+        state.presence.remove(stored_key);
     } else {
         // Notify remaining members with updated peer list.
-        if let Some(members) = state.rooms.get(room_name) {
+        if let Some(members) = state.rooms.get(stored_key) {
             let member_list: Vec<String> = members.iter().cloned().collect();
             let peers_json =
                 serde_json::to_string(&member_list).unwrap_or_else(|_| "[]".to_string());
             let notification = format!(
                 r#"{{"type":"ROOM-PEERS","room":"{}","payload":{}}}"#,
-                room_name, peers_json
+                display_name, peers_json
             );
             for member_id in members.iter() {
                 if let Some(sender) = state.ws_senders.get(member_id.as_str()) {
@@ -407,7 +497,7 @@ pub fn remove_client_from_room(state: &AppState, client_id: &str, room_name: &st
 
     // Update reverse index.
     if let Some(mut rooms) = state.client_rooms.get_mut(client_id) {
-        rooms.remove(room_name);
+        rooms.remove(stored_key);
     }
 }
 
@@ -486,4 +576,49 @@ pub fn make_error_json(error: &PeerError) -> String {
     let error_msg = error.as_str();
     // Manual serialization for error messages (cold path, but consistent).
     format!(r#"{{"type":"ERROR","payload":{{"msg":"{}"}}}}"#, error_msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::validation::is_valid_identifier;
+
+    #[test]
+    fn two_tenants_same_room_do_not_collide() {
+        // The core multi-tenant safety property: identical room names under
+        // different tenants map to distinct storage keys, and neither equals
+        // the self-host (no-tenant) key.
+        let a = namespace_room(Some("t_aaa"), "lobby");
+        let b = namespace_room(Some("t_bbb"), "lobby");
+        let selfhost = namespace_room(None, "lobby");
+
+        assert_ne!(a, b);
+        assert_ne!(a, selfhost);
+        assert_ne!(b, selfhost);
+        assert_eq!(selfhost, "lobby");
+    }
+
+    #[test]
+    fn display_strips_tenant_prefix_and_round_trips() {
+        for (tenant, room) in [
+            (Some("t_x"), "lobby"),
+            (Some("t_y"), "game-42"),
+            (None, "raw"),
+        ] {
+            let key = namespace_room(tenant, room);
+            assert_eq!(room_display(&key), room);
+        }
+    }
+
+    #[test]
+    fn client_room_name_cannot_forge_a_tenant_boundary() {
+        // The separator is rejected by identifier validation, so a client can
+        // never submit a room name that contains it to impersonate another
+        // tenant's namespace.
+        let sep = TENANT_SEP.to_string();
+        assert!(!is_valid_identifier(&sep));
+        assert!(!is_valid_identifier(&format!("t_other{sep}lobby")));
+        // A valid room name has no separator, so display() returns it whole.
+        assert_eq!(room_display("lobby"), "lobby");
+    }
 }

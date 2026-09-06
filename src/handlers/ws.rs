@@ -25,6 +25,8 @@ pub struct WsQuery {
     pub last_seq: Option<u64>,
     /// Optional JWT for authenticated connections.
     pub jwt: Option<String>,
+    /// Tenant API key (hosted/multi-tenant deployments).
+    pub api_key: Option<String>,
 }
 
 /// WebSocket upgrade handler.
@@ -59,6 +61,27 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
         send_error_and_close(socket, &PeerError::InvalidKey).await;
         return;
     }
+
+    // Tenant resolution (hosted mode): an api_key must resolve to an active
+    // tenant; a missing api_key is allowed only in self-host mode.
+    let tenant_id = match params.api_key.as_deref() {
+        Some(api_key) => {
+            match crate::tenant::resolve_api_key(&state.redis, &state.tenant_cache, api_key).await {
+                Some(tenant) => Some(tenant.id),
+                None => {
+                    send_error_and_close(socket, &PeerError::InvalidKey).await;
+                    return;
+                }
+            }
+        }
+        None => {
+            if state.config.require_api_key {
+                send_error_and_close(socket, &PeerError::InvalidKey).await;
+                return;
+            }
+            None
+        }
+    };
 
     // Optional JWT validation — only enforced when jwt_secret is configured.
     if let Some(ref secret) = state.config.jwt_secret {
@@ -125,6 +148,9 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
 
         // Valid reconnection — update in-memory cache and Redis.
         state.clients.insert(id.clone(), ClientMeta::new(token));
+        if let Some(ref tenant_id) = tenant_id {
+            state.client_tenants.insert(id.clone(), tenant_id.clone());
+        }
 
         // Cancel any pending room removal — client reconnected within session TTL.
         let mut restored_rooms: Vec<String> = Vec::new();
@@ -168,6 +194,9 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
 
         // Insert into in-memory cache.
         state.clients.insert(id.clone(), ClientMeta::new(token));
+        if let Some(ref tenant_id) = tenant_id {
+            state.client_tenants.insert(id.clone(), tenant_id.clone());
+        }
 
         run_client(socket, &state, &id, last_seq, Vec::new()).await;
     }
@@ -239,14 +268,17 @@ async fn run_client(
     // For reconnections that restored room memberships, push a fresh
     // ROOM-PEERS for each restored room so the client knows its current
     // membership before the next heartbeat tick.
-    for room_name in &restored_rooms {
-        if let Some(members) = state.rooms.get(room_name) {
+    for stored_key in &restored_rooms {
+        if let Some(members) = state.rooms.get(stored_key) {
             let member_list: Vec<String> = members.iter().cloned().collect();
             let peers_json =
                 serde_json::to_string(&member_list).unwrap_or_else(|_| "[]".to_string());
+            // restored_rooms holds stored (tenant-namespaced) keys; echo the
+            // stripped display name to the client.
             let msg = format!(
                 r#"{{"type":"ROOM-PEERS","room":"{}","payload":{}}}"#,
-                room_name, peers_json
+                super::message::room_display(stored_key),
+                peers_json
             );
             let _ = tx.send(msg);
         }
@@ -303,7 +335,11 @@ async fn run_client(
                                 MessageType::DATA => "data",
                                 _ => "signaling",
                             };
-                            let limit = if bucket == "data" { rate_limit_data } else { rate_limit_signaling };
+                            let limit = if bucket == "data" {
+                                rate_limit_data
+                            } else {
+                                rate_limit_signaling
+                            };
                             tracing::warn!(
                                 client_id = %client_id,
                                 bucket = %bucket,
@@ -351,6 +387,7 @@ async fn run_client(
             state_clone.release_connection_slot();
         }
         state_clone.client_claims.remove(&client_id);
+        state_clone.client_tenants.remove(&client_id);
         state_clone.rate_limiter.remove_client(&client_id);
         super::message::remove_client_from_all_rooms(&state_clone, &client_id);
         let _ = redis_realm::remove_client(&state_clone.redis, &client_id).await;

@@ -95,6 +95,10 @@ pub async fn get_peers(
     }
 
     // If a room is specified, return only peers in that room.
+    // ponytail: discovery is keyed by the bare room name and is a self-host
+    // feature (allow_discovery defaults off, and this path has no api_key /
+    // tenant context). Leave it off in hosted mode; add tenant scoping here
+    // if discovery is ever exposed to tenants.
     if let Some(ref room_name) = params.room {
         let members: Vec<String> = state
             .rooms
@@ -124,18 +128,6 @@ pub struct TurnQuery {
     /// Optional peer ID to embed in the TURN username.
     /// If omitted, defaults to "dendri" (backward compatible).
     pub peer_id: Option<String>,
-}
-
-/// GET /turn — backward-compatible alias for `GET /:key/turn-credentials`.
-///
-/// Uses the server's configured key so clients that hit the flat `/turn` path
-/// (e.g. older SDK versions, e2e tests) still get credentials.
-pub async fn turn_credentials_root(
-    Query(query): Query<TurnQuery>,
-    State(state): State<AppState>,
-) -> Response {
-    let key = state.config.key.clone();
-    turn_credentials(Path(key), Query(query), State(state)).await
 }
 
 /// GET /:key/turn-credentials — generate ephemeral TURN credentials.

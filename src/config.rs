@@ -104,6 +104,14 @@ pub struct Config {
     #[arg(long, default_value_t = 50)]
     pub max_room_size: usize,
 
+    /// Maximum rooms a single client may join (0 = unlimited)
+    #[arg(long, default_value_t = 32, env = "DENDRI_MAX_ROOMS_PER_CLIENT")]
+    pub max_rooms_per_client: usize,
+
+    /// Maximum distinct rooms server-wide (0 = unlimited)
+    #[arg(long, default_value_t = 10000, env = "DENDRI_MAX_TOTAL_ROOMS")]
+    pub max_total_rooms: usize,
+
     /// Max messages per client replay buffer
     #[arg(long, default_value_t = 1000)]
     pub replay_buffer_size: usize,
@@ -120,6 +128,39 @@ pub struct Config {
     #[arg(long, env = "DENDRI_JWT_SECRET")]
     pub jwt_secret: Option<String>,
 
+    /// Admin API bearer token. Setting this mounts the /admin tenant CRUD routes.
+    #[arg(long, env = "DENDRI_ADMIN_TOKEN")]
+    pub admin_token: Option<String>,
+
+    /// Require a valid tenant API key on every connection (hosted/SaaS mode).
+    /// Off = self-host mode: connections without an api_key use the shared key only.
+    #[arg(long, env = "DENDRI_REQUIRE_API_KEY")]
+    pub require_api_key: bool,
+
+    /// Alibaba DirectMail RAM access key id (enables dashboard magic-link email).
+    #[arg(long, env = "DENDRI_MAIL_AK_ID")]
+    pub mail_ak_id: Option<String>,
+
+    /// Alibaba DirectMail RAM access key secret.
+    #[arg(long, env = "DENDRI_MAIL_AK_SECRET")]
+    pub mail_ak_secret: Option<String>,
+
+    /// DirectMail region (endpoint dm.<region>.aliyuncs.com).
+    #[arg(long, env = "DENDRI_MAIL_REGION", default_value = "ap-southeast-1")]
+    pub mail_region: String,
+
+    /// From address for transactional email.
+    #[arg(long, env = "DENDRI_MAIL_FROM", default_value = "noreply@dendri.dev")]
+    pub mail_from: String,
+
+    /// Base URL of the customer dashboard (used in magic-link emails).
+    #[arg(
+        long,
+        env = "DENDRI_DASHBOARD_URL",
+        default_value = "https://app.dendri.dev"
+    )]
+    pub dashboard_url: String,
+
     /// Webhook URL to receive server event notifications (optional)
     #[arg(long, env = "DENDRI_WEBHOOK_URL")]
     pub webhook_url: Option<String>,
@@ -135,8 +176,4 @@ pub struct Config {
     /// Strip ICE candidates from SDP before forwarding (privacy: prevents IP leaks)
     #[arg(long, env = "DENDRI_STRIP_ICE_CANDIDATES")]
     pub strip_ice_candidates: bool,
-
-    /// Enable telemetry collection for measurement studies (opt-in, anonymised)
-    #[arg(long, env = "DENDRI_TELEMETRY")]
-    pub telemetry_enabled: bool,
 }

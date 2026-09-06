@@ -5,6 +5,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod config;
+mod email;
 mod enums;
 mod handlers;
 mod models;
@@ -14,6 +15,7 @@ mod redis_realm;
 mod replay_buffer;
 mod services;
 mod state;
+mod tenant;
 mod validation;
 mod webhook;
 
@@ -95,6 +97,12 @@ async fn main() {
     let sslkey = config.sslkey.clone();
     let sslcert = config.sslcert.clone();
 
+    if config.key == "dendri" {
+        tracing::warn!(
+            "Running with the default key \"dendri\" — set --key or DENDRI_KEY to a strong secret for any non-local deployment"
+        );
+    }
+
     // Build app state.
     let state = match AppState::new(config).await {
         Ok(s) => s,
@@ -121,7 +129,6 @@ async fn main() {
                 async move { handle.render() }
             }),
         )
-        .route("/turn", get(handlers::api::turn_credentials_root))
         .route(&format!("{base}/"), get(handlers::api::root))
         .route(&format!("{base}/:key/id"), get(handlers::api::get_id))
         .route(&format!("{base}/:key/peers"), get(handlers::api::get_peers))
@@ -136,7 +143,12 @@ async fn main() {
         )
         .route(
             &format!("{base}/http/send"),
-            post(handlers::http::send_handler),
+            post(handlers::http::send_handler)
+                // WS enforces max_message_size on every frame; give the HTTP
+                // send path the same ceiling instead of axum's 2 MB default.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    state.config.max_message_size,
+                )),
         )
         .route(
             &format!("{base}/http/poll"),
@@ -147,7 +159,16 @@ async fn main() {
                 axum::http::StatusCode::NOT_FOUND,
                 axum::Json(serde_json::json!({"error": "Not Found"})),
             )
-        })
+        });
+
+    // Admin + customer-dashboard APIs — mounted only when an admin token is
+    // configured (that token also signs dashboard session JWTs).
+    if state.config.admin_token.is_some() {
+        app = app.merge(handlers::admin::router());
+        app = app.merge(handlers::customer::router());
+    }
+
+    let mut app = app
         .layer(cors)
         .layer(
             TraceLayer::new_for_http()
@@ -167,7 +188,9 @@ async fn main() {
                     );
                 })
                 .on_response(
-                    |response: &axum::http::Response<_>, latency: std::time::Duration, _span: &Span| {
+                    |response: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     _span: &Span| {
                         tracing::info!(
                             status = response.status().as_u16(),
                             latency_ms = latency.as_millis(),

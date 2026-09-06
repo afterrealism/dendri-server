@@ -26,6 +26,8 @@ pub struct HttpQuery {
     pub token: String,
     pub key: Option<String>,
     pub last_seq: Option<u64>,
+    /// Tenant API key (hosted/multi-tenant deployments).
+    pub api_key: Option<String>,
 }
 
 /// GET /http/sse -- Server-Sent Events stream for receiving messages.
@@ -42,12 +44,29 @@ pub async fn sse_handler(
     let id = params.id;
     let token = params.token;
 
-    // Validate key (constant-time to avoid timing oracles).
-    if let Some(ref key) = params.key {
-        if !constant_time_str_eq(key, &state.config.key) {
-            return Err((StatusCode::UNAUTHORIZED, "Invalid key"));
-        }
+    // Validate key (constant-time to avoid timing oracles). The key is
+    // required — treating it as optional made the shared key advisory for
+    // SSE clients while WS clients were forced to present it.
+    match params.key {
+        Some(ref key) if constant_time_str_eq(key, &state.config.key) => {}
+        _ => return Err((StatusCode::UNAUTHORIZED, "Invalid key")),
     }
+
+    // Tenant resolution (hosted mode) — same contract as the WS handler.
+    let tenant_id = match params.api_key.as_deref() {
+        Some(api_key) => {
+            match crate::tenant::resolve_api_key(&state.redis, &state.tenant_cache, api_key).await {
+                Some(tenant) => Some(tenant.id),
+                None => return Err((StatusCode::UNAUTHORIZED, "Invalid api_key")),
+            }
+        }
+        None => {
+            if state.config.require_api_key {
+                return Err((StatusCode::UNAUTHORIZED, "api_key required"));
+            }
+            None
+        }
+    };
 
     // Handle reconnection: validate token if client already exists.
     let is_new_client = !state.clients.contains_key(&id);
@@ -74,6 +93,9 @@ pub async fn sse_handler(
     let meta = ClientMeta::with_transport(token, TransportKind::Sse);
     state.clients.insert(id.clone(), meta);
     state.ws_senders.insert(id.clone(), tx.clone());
+    if let Some(tenant_id) = tenant_id {
+        state.client_tenants.insert(id.clone(), tenant_id);
+    }
 
     // Send OPEN message.
     let _ = tx.send(r#"{"type":"OPEN"}"#.to_string());
@@ -150,14 +172,12 @@ pub async fn send_handler(
 ) -> impl IntoResponse {
     let id = params.id;
 
-    // Verify client exists.
-    if !state.clients.contains_key(&id) {
-        return (StatusCode::UNAUTHORIZED, "Client not registered").into_response();
-    }
-
-    // Touch heartbeat.
-    if let Some(client) = state.clients.get(&id) {
-        client.touch();
+    // Verify client exists AND the caller holds its session token. Without
+    // the token comparison, anyone who learns a peer ID (e.g. from a room
+    // peer list) could POST signaling or DATA as that peer.
+    match state.clients.get(&id) {
+        Some(client) if client.token == params.token => client.touch(),
+        _ => return (StatusCode::UNAUTHORIZED, "Client not registered").into_response(),
     }
 
     // Parse and handle message.
@@ -225,9 +245,10 @@ pub async fn poll_handler(
     let id = params.id;
     let token = params.token;
 
-    // Validate key (constant-time).
-    if let Some(ref key) = params.key {
-        if !constant_time_str_eq(key, &state.config.key) {
+    // Validate key (constant-time). Required — same reasoning as sse_handler.
+    match params.key {
+        Some(ref key) if constant_time_str_eq(key, &state.config.key) => {}
+        _ => {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "Invalid key"})),
@@ -235,6 +256,32 @@ pub async fn poll_handler(
                 .into_response();
         }
     }
+
+    // Tenant resolution (hosted mode) — same contract as the WS handler.
+    let tenant_id = match params.api_key.as_deref() {
+        Some(api_key) => {
+            match crate::tenant::resolve_api_key(&state.redis, &state.tenant_cache, api_key).await {
+                Some(tenant) => Some(tenant.id),
+                None => {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": "Invalid api_key"})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => {
+            if state.config.require_api_key {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "api_key required"})),
+                )
+                    .into_response();
+            }
+            None
+        }
+    };
 
     let is_new_client = !state.clients.contains_key(&id);
 
@@ -290,6 +337,9 @@ pub async fn poll_handler(
 
         let meta = ClientMeta::with_transport(token, TransportKind::Polling);
         state.clients.insert(id.clone(), meta);
+        if let Some(tenant_id) = tenant_id {
+            state.client_tenants.insert(id.clone(), tenant_id);
+        }
 
         // Send OPEN message.
         let _ = tx.send(r#"{"type":"OPEN"}"#.to_string());
@@ -391,6 +441,7 @@ async fn cleanup_client(state: &AppState, client_id: &str) {
         state.release_connection_slot();
     }
     state.client_claims.remove(client_id);
+    state.client_tenants.remove(client_id);
     state.rate_limiter.remove_client(client_id);
     super::message::remove_client_from_all_rooms(state, client_id);
 

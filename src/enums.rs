@@ -26,14 +26,6 @@ pub enum MessageType {
     RoomPeers,
     #[serde(rename = "PRESENCE-UPDATE")]
     PresenceUpdate,
-    #[serde(rename = "KEY-EXCHANGE")]
-    KeyExchange,
-    #[serde(rename = "CONNECT-REQUEST")]
-    ConnectRequest,
-    #[serde(rename = "DCUTR-CONNECT")]
-    DcutrConnect,
-    #[serde(rename = "DCUTR-SYNC")]
-    DcutrSync,
 }
 
 impl MessageType {
@@ -54,10 +46,6 @@ impl MessageType {
             Self::RoomLeave => "ROOM-LEAVE",
             Self::RoomPeers => "ROOM-PEERS",
             Self::PresenceUpdate => "PRESENCE-UPDATE",
-            Self::KeyExchange => "KEY-EXCHANGE",
-            Self::ConnectRequest => "CONNECT-REQUEST",
-            Self::DcutrConnect => "DCUTR-CONNECT",
-            Self::DcutrSync => "DCUTR-SYNC",
         }
     }
 }

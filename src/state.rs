@@ -108,6 +108,12 @@ pub struct AppState {
     pub presence: Arc<DashMap<String, DashMap<String, String>>>,
     /// Per-client JWT claims (stored after successful JWT validation).
     pub client_claims: Arc<DashMap<String, serde_json::Value>>,
+    /// Client ID -> tenant ID, for clients that authenticated with an API key.
+    pub client_tenants: Arc<DashMap<String, String>>,
+    /// In-process cache for API-key → tenant lookups.
+    pub tenant_cache: Arc<crate::tenant::TenantCache>,
+    /// Transactional email sender (DirectMail). None when mail isn't configured.
+    pub mailer: Option<Arc<crate::email::Mailer>>,
     /// Optional webhook sender for server event notifications.
     pub webhook: Option<Arc<WebhookSender>>,
     /// Atomic count of live connections. Used to enforce `concurrent_limit`
@@ -188,6 +194,18 @@ impl AppState {
                 config.webhook_secret.clone(),
             )))
         });
+        let mailer = match (&config.mail_ak_id, &config.mail_ak_secret) {
+            (Some(id), Some(secret)) => Some(Arc::new(crate::email::Mailer::new(
+                id.clone(),
+                secret.clone(),
+                config.mail_region.clone(),
+                config.mail_from.clone(),
+            ))),
+            _ => {
+                tracing::info!("DirectMail not configured; dashboard magic-link login disabled");
+                None
+            }
+        };
         Ok(Self {
             ws_senders: Arc::new(DashMap::new()),
             clients: Arc::new(DashMap::new()),
@@ -202,6 +220,9 @@ impl AppState {
             pending_removals: Arc::new(DashMap::new()),
             presence: Arc::new(DashMap::new()),
             client_claims: Arc::new(DashMap::new()),
+            client_tenants: Arc::new(DashMap::new()),
+            tenant_cache: Arc::new(crate::tenant::TenantCache::new()),
+            mailer,
             webhook,
             active_connections: Arc::new(AtomicUsize::new(0)),
             polling_receivers: Arc::new(DashMap::new()),
