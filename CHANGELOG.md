@@ -2,9 +2,11 @@
 
 All notable changes to the Dendri signaling server. This project adheres to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.0] - Unreleased
 
 ### Added
+- Per-tenant `jwt_secret`: hosted tenants can require HS256 JWTs whose `rooms` claim gates room joins (WS, SSE and polling transports). Optional `tid` claim is verified against the tenant id.
+- Admin API: `jwt_secret` on `POST /admin/tenants`, new `POST /admin/tenants/:id/rotate-jwt-secret`.
 - `--key-file` flag (`DENDRI_KEY_FILE` env) for reading shared secret from file
 - `--discovery-token` flag (`DENDRI_DISCOVERY_TOKEN` env) for `/peers` endpoint auth
 - `--jwt-secret` flag (`DENDRI_JWT_SECRET` env) for HS256 JWT authentication
@@ -30,6 +32,7 @@ All notable changes to the Dendri signaling server. This project adheres to [Kee
 - Dockerfile: 3-stage `cargo-chef` build, non-root user (UID 1001), pinned base images
 
 ### Fixed
+- JWT room ACL was bypassable over the SSE/polling HTTP signaling transports.
 - DashMap lock held across async in `sync_redis` — keys collected before iteration
 - SSRF webhook protection: added IPv6 private ranges + full RFC 1918 block
 - Identical branches collapsed in `handle_transmission`
