@@ -24,6 +24,24 @@ pub fn room_allowed(claims: &serde_json::Value, room: &str) -> bool {
     }
 }
 
+/// Which secret (if any) governs this connection, per the precedence rule:
+/// per-tenant secret > global secret > none.
+pub fn effective_jwt_secret<'a>(
+    tenant_secret: Option<&'a str>,
+    global_secret: Option<&'a str>,
+) -> Option<&'a str> {
+    tenant_secret.or(global_secret)
+}
+
+/// If claims carry a `tid` (tenant id) it must equal the resolved tenant.
+/// Absent `tid` is allowed (secret possession is already tenant proof).
+pub fn tid_matches(claims: &serde_json::Value, tenant_id: &str) -> bool {
+    match claims.get("tid").and_then(|t| t.as_str()) {
+        None => true,
+        Some(tid) => tid == tenant_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +89,21 @@ mod tests {
         assert!(room_allowed(&json!({"rooms":["lobby","game"]}), "game")); // listed
         assert!(!room_allowed(&json!({"rooms":["lobby"]}), "game")); // not listed
         assert!(room_allowed(&json!({"rooms":"not-an-array"}), "game")); // non-array ignored
+    }
+
+    #[test]
+    fn per_tenant_secret_takes_precedence_over_global() {
+        assert_eq!(effective_jwt_secret(Some("t"), Some("g")), Some("t"));
+        assert_eq!(effective_jwt_secret(None, Some("g")), Some("g"));
+        assert_eq!(effective_jwt_secret(None, None), None);
+    }
+
+    #[test]
+    fn tid_claim_must_match_tenant_when_present() {
+        let claims = json!({"sub":"u","tid":"t_1","exp":4102444800u64});
+        assert!(tid_matches(&claims, "t_1"));
+        assert!(!tid_matches(&claims, "t_2"));
+        let no_tid = json!({"sub":"u","exp":4102444800u64});
+        assert!(tid_matches(&no_tid, "t_any")); // absent → allowed
     }
 }

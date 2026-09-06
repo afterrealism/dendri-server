@@ -64,10 +64,10 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
 
     // Tenant resolution (hosted mode): an api_key must resolve to an active
     // tenant; a missing api_key is allowed only in self-host mode.
-    let tenant_id = match params.api_key.as_deref() {
+    let resolved_tenant = match params.api_key.as_deref() {
         Some(api_key) => {
             match crate::tenant::resolve_api_key(&state.redis, &state.tenant_cache, api_key).await {
-                Some(tenant) => Some(tenant.id),
+                Some(tenant) => Some(tenant),
                 None => {
                     send_error_and_close(socket, &PeerError::InvalidKey).await;
                     return;
@@ -82,12 +82,27 @@ async fn handle_socket(socket: WebSocket, params: WsQuery, state: AppState) {
             None
         }
     };
+    let tenant_id = resolved_tenant.as_ref().map(|t| t.id.clone());
 
-    // Optional JWT validation — only enforced when jwt_secret is configured.
-    if let Some(ref secret) = state.config.jwt_secret {
+    // Optional JWT validation — enforced when the effective secret (per-tenant
+    // first, then global) is configured for this connection.
+    let effective_secret = crate::jwt::effective_jwt_secret(
+        resolved_tenant
+            .as_ref()
+            .and_then(|t| t.jwt_secret.as_deref()),
+        state.config.jwt_secret.as_deref(),
+    );
+    if let Some(secret) = effective_secret {
         let jwt_token = params.jwt.as_deref().unwrap_or("");
         match crate::jwt::validate_jwt(secret, jwt_token) {
             Ok(claims) => {
+                if let Some(ref t) = resolved_tenant {
+                    if !crate::jwt::tid_matches(&claims, &t.id) {
+                        tracing::warn!(client = %id, tenant = %t.id, "JWT tid mismatch");
+                        send_error_and_close(socket, &PeerError::InvalidToken).await;
+                        return;
+                    }
+                }
                 tracing::debug!(client = %id, claims = ?claims, "JWT validated");
                 state.client_claims.insert(id.clone(), claims);
             }
