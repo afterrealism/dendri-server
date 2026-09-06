@@ -56,6 +56,12 @@ pub struct Tenant {
     /// Billing/contact email (set at checkout). Used for the customer dashboard.
     #[serde(default)]
     pub email: Option<String>,
+    /// Per-tenant JWT secret for room ACLs (hosted). When set, connections
+    /// presenting this tenant's API key must also present a `jwt` verified
+    /// with this secret; the JWT's `rooms` claim gates room joins.
+    /// Never serialized into GET/admin view responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_secret: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -301,6 +307,7 @@ mod tests {
             max_rooms: 5,
             max_peers: 100,
             email: Some("ops@example.com".into()),
+            jwt_secret: None,
         };
         let round: Tenant = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert_eq!(round, full);
@@ -317,6 +324,7 @@ mod tests {
             max_rooms: 0,
             max_peers: 0,
             email: None,
+            jwt_secret: None,
         };
 
         cache.put("h1".into(), Some(tenant.clone()));
@@ -327,5 +335,28 @@ mod tests {
 
         cache.invalidate_all();
         assert_eq!(cache.get("h1"), None);
+    }
+
+    #[test]
+    fn tenant_roundtrip_with_jwt_secret() {
+        let t = Tenant {
+            id: "t_abc123def456".into(),
+            name: "Acme".into(),
+            origins: vec![],
+            active: true,
+            max_rooms: 0,
+            max_peers: 0,
+            email: None,
+            jwt_secret: Some("tenant-secret".into()),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Tenant = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.jwt_secret.as_deref(), Some("tenant-secret"));
+
+        // Old records without the field still deserialize.
+        let legacy =
+            r#"{"id":"t_x","name":"Old","origins":[],"active":true,"max_rooms":0,"max_peers":0}"#;
+        let old: Tenant = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.jwt_secret, None);
     }
 }

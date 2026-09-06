@@ -89,6 +89,7 @@ async fn create_tenant(
         max_rooms: req.max_rooms,
         max_peers: req.max_peers,
         email: req.email,
+        jwt_secret: None,
     };
     let api_key = tenant::generate_api_key();
 
