@@ -8,6 +8,7 @@ mod config;
 mod email;
 mod enums;
 mod handlers;
+mod jwt;
 mod models;
 mod pii;
 mod rate_limiter;

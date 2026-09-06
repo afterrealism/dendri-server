@@ -5,9 +5,11 @@
 //!
 //! Two sign-in paths, both yielding a 7-day **session JWT** (HS256, signed with
 //! the server's admin token) that the dashboard sends as `Authorization: Bearer`:
+//!
 //!   1. API key — `POST /auth/login` exchanges a tenant's `dk_` key for a session.
 //!   2. Email magic-link — `POST /auth/request` emails a 15-min link (DirectMail);
 //!      `POST /auth/magic` exchanges that link's token for a session.
+//!
 //! The JWT `purpose` claim ("session" vs "magic") stops a magic token from being
 //! used as a session. Mounted only when `--admin-token` is set (the signing key).
 

@@ -248,24 +248,19 @@ async fn handle_room_join(state: &AppState, client_id: &str, msg: Message) {
 
     // Check room access control (if JWT claims exist for this client).
     if let Some(claims) = state.client_claims.get(client_id) {
-        if let Some(allowed_rooms) = claims.get("rooms") {
-            if let Some(rooms_array) = allowed_rooms.as_array() {
-                let room_allowed = rooms_array.iter().any(|r| r.as_str() == Some(&room_name));
-                if !room_allowed {
-                    let error = format!(
-                        r#"{{"type":"ROOM-JOIN-DENIED","room":"{}","reason":"auth_denied"}}"#,
-                        room_name
-                    );
-                    if let Some(sender) = state.ws_senders.get(client_id) {
-                        let _ = sender.send(error);
-                    }
-                    return;
-                }
+        if !crate::jwt::room_allowed(&claims, &room_name) {
+            let error = format!(
+                r#"{{"type":"ROOM-JOIN-DENIED","room":"{}","reason":"auth_denied"}}"#,
+                room_name
+            );
+            if let Some(sender) = state.ws_senders.get(client_id) {
+                let _ = sender.send(error);
             }
+            return;
         }
-        // If no "rooms" claim, all rooms are allowed (backward compat).
     }
-    // If no claims at all (no JWT), all rooms are allowed (backward compat).
+    // No claims at all (no JWT), no `rooms` claim, or non-array claim →
+    // all rooms allowed (backward compat).
 
     // Tenant-namespaced storage key. All map access below uses this; the
     // client-visible `room_name` is still echoed in responses.
