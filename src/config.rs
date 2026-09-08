@@ -161,6 +161,11 @@ pub struct Config {
     )]
     pub dashboard_url: String,
 
+    /// Base URL of the marketing site (used in "no account found" sign-in
+    /// emails that point at pricing / self-hosting docs).
+    #[arg(long, env = "DENDRI_WEBSITE_URL", default_value = "https://dendri.dev")]
+    pub website_url: String,
+
     /// Webhook URL to receive server event notifications (optional)
     #[arg(long, env = "DENDRI_WEBHOOK_URL")]
     pub webhook_url: Option<String>,

@@ -8,7 +8,10 @@
 //!
 //!   1. API key — `POST /auth/login` exchanges a tenant's `dk_` key for a session.
 //!   2. Email magic-link — `POST /auth/request` emails a 15-min link (DirectMail);
-//!      `POST /auth/magic` exchanges that link's token for a session.
+//!      `POST /auth/magic` exchanges that link's token for a session. An
+//!      unregistered address gets a "no account — pick a plan or self-host"
+//!      email instead (cooldown-limited), so the response stays generic and
+//!      reveals nothing to enumeration.
 //!
 //! The JWT `purpose` claim ("session" vs "magic") stops a magic token from being
 //! used as a session. Mounted only when `--admin-token` is set (the signing key).
@@ -174,9 +177,75 @@ struct EmailRequest {
     email: String,
 }
 
+/// Cooldown for the "no account found" email: one per address per window, so
+/// `POST /auth/request` can't be used to spam third parties.
+const NO_ACCOUNT_COOLDOWN_SECS: u64 = 10 * 60;
+
+/// Minimal shape check before an address is handed to the email API: one `@`
+/// between non-empty local and domain parts, a dot in the domain, no
+/// whitespace/control characters, sane length. Not RFC 5322 — DirectMail
+/// rejects whatever this lets through, and this keeps junk out of the API.
+fn plausible_email(email: &str) -> bool {
+    if email.len() < 3 || email.len() > 254 {
+        return false;
+    }
+    if email.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.contains('@')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+}
+
+/// Redis key for the no-account cooldown (mirrors the plaintext `tenant:email:`
+/// key convention).
+fn no_account_cooldown_key(email: &str) -> String {
+    format!("auth:no-account:{}", email.to_ascii_lowercase())
+}
+
+/// Try to acquire the once-per-window send slot for a no-account email.
+/// Returns false when a recent send is still cooling down *or* Redis errored —
+/// fail closed: when in doubt, don't send.
+async fn acquire_no_account_slot(redis: &redis::aio::ConnectionManager, email: &str) -> bool {
+    let mut conn = redis.clone();
+    let res: redis::RedisResult<Option<String>> = redis::cmd("SET")
+        .arg(no_account_cooldown_key(email))
+        .arg("1")
+        .arg("EX")
+        .arg(NO_ACCOUNT_COOLDOWN_SECS)
+        .arg("NX")
+        .query_async(&mut conn)
+        .await;
+    matches!(res, Ok(Some(_)))
+}
+
+/// Body of the "no account found" email: points the mailbox owner at the
+/// pricing page (hosted plans) or the self-hosting guide (free forever).
+fn no_account_email_html(website_url: &str, dashboard_url: &str) -> String {
+    format!(
+        "<p>You requested a sign-in link for the Dendri dashboard, but this email \
+         address doesn't have a hosted account yet.</p>\
+         <p><strong>To get one:</strong> choose a hosted plan on the \
+         <a href=\"{website_url}/pricing/\">Dendri pricing page</a>. After checkout \
+         your API key arrives by email, and you can sign in at the \
+         <a href=\"{dashboard_url}\">Dendri dashboard</a> with this address.</p>\
+         <p>Prefer to run it yourself? The Dendri server is open source and free \
+         forever — follow the \
+         <a href=\"{website_url}/docs/self-hosting/\">self-hosting guide</a>.</p>\
+         <p>If you didn't request this, you can ignore this email.</p>"
+    )
+}
+
 /// POST /auth/request — email a one-time magic-link login. Always returns 200
-/// (never reveals whether an email is registered). Sends only when the email
-/// maps to a tenant and DirectMail is configured.
+/// (never reveals whether an email is registered). A registered address gets a
+/// login link; an unregistered address gets a "pick a plan or self-host" email
+/// (at most one per cooldown window). Nothing is sent when DirectMail is not
+/// configured or the address is junk.
 async fn request_magic_link(
     State(state): State<AppState>,
     Json(req): Json<EmailRequest>,
@@ -184,7 +253,7 @@ async fn request_magic_link(
     let generic = || {
         (
             StatusCode::OK,
-            Json(json!({"message": "If that email has an account, a login link is on its way."})),
+            Json(json!({"message": "Check your inbox for an email from Dendri."})),
         )
             .into_response()
     };
@@ -197,28 +266,54 @@ async fn request_magic_link(
     };
 
     let email = req.email.trim().to_string();
-    let tenant_id = match crate::tenant::get_tenant_id_by_email(&state.redis, &email).await {
-        Ok(Some(id)) => id,
-        _ => return generic(), // unknown email or lookup error — same response
-    };
+    if !plausible_email(&email) {
+        return generic(); // junk input — same response, nothing sent
+    }
 
-    if let Some(token) = sign_token(&secret, &tenant_id, "magic", MAGIC_TTL_SECS) {
-        let link = format!(
-            "{}/#magic={}",
-            state.config.dashboard_url.trim_end_matches('/'),
-            token
-        );
-        let html = format!(
-            "<p>Click to sign in to your Dendri dashboard. This link expires in 15 minutes.</p>\
-             <p><a href=\"{link}\">Sign in to Dendri</a></p>\
-             <p>If you didn't request this, you can ignore this email.</p>"
-        );
-        // Fire-and-forget: don't block the response or leak send failures.
-        tokio::spawn(async move {
-            if let Err(e) = mailer.send(&email, "Sign in to Dendri", &html).await {
-                tracing::error!(error = %e, "magic-link email send failed");
+    match crate::tenant::get_tenant_id_by_email(&state.redis, &email).await {
+        // Registered address → magic link (existing path).
+        Ok(Some(tenant_id)) => {
+            if let Some(token) = sign_token(&secret, &tenant_id, "magic", MAGIC_TTL_SECS) {
+                let link = format!(
+                    "{}/#magic={}",
+                    state.config.dashboard_url.trim_end_matches('/'),
+                    token
+                );
+                let html = format!(
+                    "<p>Click to sign in to your Dendri dashboard. This link expires in 15 minutes.</p>\
+                     <p><a href=\"{link}\">Sign in to Dendri</a></p>\
+                     <p>If you didn't request this, you can ignore this email.</p>"
+                );
+                // Fire-and-forget: don't block the response or leak send failures.
+                let mailer = mailer.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = mailer.send(&email, "Sign in to Dendri", &html).await {
+                        tracing::error!(error = %e, "magic-link email send failed");
+                    }
+                });
             }
-        });
+        }
+        // Unregistered address → tell the mailbox owner how to get an account.
+        Ok(None) => {
+            let redis = state.redis.clone();
+            let website_url = state.config.website_url.trim_end_matches('/').to_string();
+            let dashboard_url = state.config.dashboard_url.trim_end_matches('/').to_string();
+            tokio::spawn(async move {
+                if !acquire_no_account_slot(&redis, &email).await {
+                    return; // a send is still cooling down — stay silent
+                }
+                let html = no_account_email_html(&website_url, &dashboard_url);
+                match mailer
+                    .send(&email, "Sign in to Dendri — no account found", &html)
+                    .await
+                {
+                    Ok(()) => tracing::info!("no-account (get-a-plan) email sent"),
+                    Err(e) => tracing::error!(error = %e, "no-account email send failed"),
+                }
+            });
+        }
+        // Lookup error → send nothing; same generic response.
+        Err(_) => {}
     }
     generic()
 }
@@ -325,5 +420,52 @@ async fn rotate_key(State(state): State<AppState>, headers: HeaderMap) -> Respon
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plausible_email_accepts_normal_addresses() {
+        assert!(plausible_email("sheece.gardezi@afterrealism.com"));
+        assert!(plausible_email("a@b.co"));
+        assert!(plausible_email("first+tag@sub.example.org"));
+    }
+
+    #[test]
+    fn plausible_email_rejects_junk() {
+        assert!(!plausible_email(""));
+        assert!(!plausible_email("no-at-sign"));
+        assert!(!plausible_email("@no-local.com"));
+        assert!(!plausible_email("no-domain@"));
+        assert!(!plausible_email("no-dot@localhost"));
+        assert!(!plausible_email("two@@example.com"));
+        assert!(!plausible_email("spa ce@example.com"));
+        assert!(!plausible_email("trailing@example.com "));
+        assert!(!plausible_email("a@.example.com"));
+        assert!(!plausible_email("a@example.com."));
+        assert!(!plausible_email(&format!(
+            "{}@example.com",
+            "x".repeat(250)
+        )));
+    }
+
+    #[test]
+    fn cooldown_key_is_namespaced_and_lowercased() {
+        assert_eq!(
+            no_account_cooldown_key("Mixed@Example.COM"),
+            "auth:no-account:mixed@example.com"
+        );
+    }
+
+    #[test]
+    fn no_account_email_points_at_pricing_and_self_hosting() {
+        let html = no_account_email_html("https://dendri.dev", "https://app.dendri.dev");
+        assert!(html.contains("https://dendri.dev/pricing/"));
+        assert!(html.contains("https://dendri.dev/docs/self-hosting/"));
+        assert!(html.contains("https://app.dendri.dev"));
+        assert!(html.contains("doesn't have a hosted account"));
     }
 }
